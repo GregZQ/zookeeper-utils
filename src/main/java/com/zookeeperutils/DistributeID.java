@@ -46,7 +46,7 @@ public class DistributeID {
 
     public static String generateID() throws Exception {
         String jobName = ZKPaths.makePath(parentPath,nodeName);
-        String path = client.create().withMode(CreateMode.PERSISTENT_SEQUENTIAL)
+        String path = client.create().withMode(CreateMode.EPHEMERAL_SEQUENTIAL)
                 .forPath(jobName);
         ZKPaths.getNodeFromPath(path);
         //创建完成之后删除，防止占用系统资源
@@ -62,7 +62,9 @@ public class DistributeID {
                     try {
                         countDownLatch.await();
                         System.out.println("ID为"+generateID());
-                    } catch (Exception e) {}
+                    } catch (Exception e) {
+                        System.out.println(e.getMessage());
+                    }
                 }
             }).start();
         }

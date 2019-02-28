@@ -1,15 +1,20 @@
 package com.zookeeperutils;
 
+import org.apache.curator.CuratorZookeeperClient;
 import org.apache.curator.framework.CuratorFramework;
 import org.apache.curator.framework.CuratorFrameworkFactory;
+import org.apache.curator.framework.recipes.cache.NodeCache;
+import org.apache.curator.framework.recipes.cache.NodeCacheListener;
 import org.apache.curator.retry.ExponentialBackoffRetry;
 import org.apache.curator.utils.ZKPaths;
 import org.apache.zookeeper.CreateMode;
+import org.apache.zookeeper.ZKUtil;
 import org.apache.zookeeper.data.Stat;
 
 import java.util.Collections;
 import java.util.List;
 import java.util.Objects;
+import java.util.concurrent.CountDownLatch;
 
 /**
  * @author GregZQ
@@ -49,37 +54,51 @@ import java.util.Objects;
 public class DistributedLock {
 
     private static String hosts ="192.168.25.128:2181";
-    private static CuratorFramework client;
     private static String parentPath = "/locks";
     private static String readLock="READ-";
     private static String writeLock="WRITE-";
+    private static ThreadLocal<CuratorFramework> threadLocal = new ThreadLocal();
 
-    public DistributedLock() throws Exception {
-        client = CuratorFrameworkFactory.builder()
+    private CuratorFramework getClient() throws Exception {
+        if (threadLocal.get()!=null){
+            throw new Exception("不可重复创建锁");
+        }
+
+        CuratorFramework client = CuratorFrameworkFactory.builder()
                 .connectString(hosts)
                 .sessionTimeoutMs(3000)
-                .retryPolicy(new ExponentialBackoffRetry(1000,3))
+                .retryPolicy(new ExponentialBackoffRetry(10000,3))
                 .build();
-
         client.start();
 
         Stat stat = client.checkExists().forPath(parentPath);
-
+        //如果父节点不存在则先创建父节点
         if (Objects.isNull(stat)){
             client.create().withMode(CreateMode.PERSISTENT)
                     .forPath(parentPath);
         }
-
+        //每个会话与线程绑定
+        threadLocal.set(client);
+        return client;
     }
 
+    public DistributedLock() throws Exception {
+    }
+
+
     public void acquireReadLock() throws Exception {
+        CuratorFramework client = getClient();
+        final CountDownLatch countDownLatch = new CountDownLatch(1);
         String jobName = ZKPaths.makePath(parentPath,readLock);
+        //添加一个临时写写节点放到树的末尾
+        client.create().withMode(CreateMode.EPHEMERAL_SEQUENTIAL).forPath(jobName);
+        //获取子节点
         List <String> list =  client.getChildren().forPath(parentPath);
+        boolean flag = true;
+        //从后往前找是否能获取到锁，如果前面存在写锁，那么阻塞并在前面节点注册监听等待
         Collections.reverse(list);
 
-        boolean flag = true;
-
-        String lockName;
+        String lockName = null;
 
         for (String value : list) {
             if (value.contains(writeLock)){
@@ -88,9 +107,82 @@ public class DistributedLock {
                 break;
             }
         }
+        //阻塞等待
         if (!flag){
+            NodeCache nodeCache = new NodeCache(client, lockName);
+            nodeCache.start();
+            nodeCache.getListenable().addListener(new NodeCacheListener() {
+                public void nodeChanged() throws Exception {
+                    countDownLatch.countDown();
+                }
+            });
+            countDownLatch.await();
+        }
+    }
+    public void acquireWriteLock() throws Exception {
+        CuratorFramework client = getClient();
+        final String jobName = ZKPaths.makePath(parentPath,writeLock);
+        //创建子节点
+        String path = client.create().withMode(CreateMode.EPHEMERAL_SEQUENTIAL).forPath(jobName);
+        //获取子节点，在最后一个子节点上注册监听
+        List<String> list = client.getChildren().forPath(parentPath);
+        Collections.reverse(list);
 
+        String lockName = null;
+        for (String name:list) {
+            if (path.contains(name)){
+                break;
+            }else{
+                lockName = name;
+            }
+        }
+
+        if (lockName != null) {
+            lockName = ZKPaths.makePath(parentPath,lockName);
+            final CountDownLatch countDownLatch = new CountDownLatch(1);
+            NodeCache nodeCache = new NodeCache(client, lockName);
+            nodeCache.start(true);
+            final String finalLockName = lockName;
+            nodeCache.getListenable().addListener(new NodeCacheListener() {
+                public void nodeChanged() throws Exception {
+                    countDownLatch.countDown();
+                }
+            });
+            countDownLatch.await();
+        }
+
+    }
+
+    public void release(){//删除临时节点
+        CuratorFramework client = threadLocal.get();
+        if (client !=null){
+            client.close();
         }
     }
 
+    public static void main(String args[]) throws Exception {
+        final DistributedLock distributedLock = new DistributedLock();
+        final CountDownLatch countDownLatch = new CountDownLatch(10);
+        distributedLock.acquireWriteLock();
+        Thread.sleep(5000);
+        distributedLock.release();
+        for (int i =0;i<10;i++){
+            new Thread(new Runnable() {
+                public void run() {
+                    countDownLatch.countDown();
+                    try {
+                        distributedLock.acquireReadLock();
+                        System.out.println("获取到锁");
+                        Thread.sleep(100);
+                        System.out.println("释放掉锁");
+                    } catch (Exception e) {
+                        System.out.println(e.getMessage());
+                    }
+                    finally {
+                        distributedLock.release();
+                    }
+                }
+            }).start();
+        }
+    }
 }
