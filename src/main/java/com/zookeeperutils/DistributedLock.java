@@ -48,7 +48,6 @@ import java.util.concurrent.CountDownLatch;
  *       对于读请求：向比自己小的最后一个写节点注册watch监听。
  *       对于写请求：向比自己小的最后一个节点注册监听
  *
- *    还未完成。。。。。
  *
  */
 public class DistributedLock {
